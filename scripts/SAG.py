@@ -56,7 +56,7 @@ class LoggedSelfAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q, k, v))
 
         # force cast to fp32 to avoid overflowing
         if _ATTN_PRECISION == "fp32":
@@ -91,7 +91,7 @@ def xattn_forward_log(self, x, context=None, mask=None):
     k = self.to_k(context)
     v = self.to_v(context)
 
-    q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+    q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q, k, v))
 
     # force cast to fp32 to avoid overflowing
     if _ATTN_PRECISION == "fp32":
