@@ -9,8 +9,6 @@ from modules.processing import StableDiffusionProcessing
 
 import math
 
-
-
 import modules.scripts as scripts
 from modules import shared
 import gradio as gr
@@ -48,7 +46,28 @@ class LoggedSelfAttention(nn.Module):
         )
         self.attn_probs = None
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, additional_tokens=None, n_times_crossframe_attn_in_self=0):
+         if additional_tokens is not None:
+            # get the number of masked tokens at the beginning of the output sequence
+            n_tokens_to_mask = additional_tokens.shape[1]
+            # add additional token
+            x = torch.cat([additional_tokens, x], dim=1)
+
+        if n_times_crossframe_attn_in_self:
+            # reprogramming cross-frame attention as in https://arxiv.org/abs/2303.13439
+            assert x.shape[0] % n_times_crossframe_attn_in_self == 0
+            # n_cp = x.shape[0]//n_times_crossframe_attn_in_self
+            k = repeat(
+                k[::n_times_crossframe_attn_in_self],	
+                "b ... -> (b n) ...",
+                n=n_times_crossframe_attn_in_self,
+            )
+            v = repeat(
+                v[::n_times_crossframe_attn_in_self],
+                "b ... -> (b n) ...",
+                n=n_times_crossframe_attn_in_self,
+            )
+        
         h = self.heads
 
         q = self.to_q(x)
@@ -81,9 +100,33 @@ class LoggedSelfAttention(nn.Module):
 
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+
+        if additional_tokens is not None:
+            out = out[:, n_tokens_to_mask:]
         return self.to_out(out)
 
-def xattn_forward_log(self, x, context=None, mask=None):
+def xattn_forward_log(self, x, context=None, mask=None, additional_tokens=None, n_times_crossframe_attn_in_self=0):
+    if additional_tokens is not None:
+        # get the number of masked tokens at the beginning of the output sequence
+        n_tokens_to_mask = additional_tokens.shape[1]
+        # add additional token
+        x = torch.cat([additional_tokens, x], dim=1)
+
+    if n_times_crossframe_attn_in_self:
+        # reprogramming cross-frame attention as in https://arxiv.org/abs/2303.13439
+        assert x.shape[0] % n_times_crossframe_attn_in_self == 0
+        # n_cp = x.shape[0]//n_times_crossframe_attn_in_self
+        k = repeat(
+            k[::n_times_crossframe_attn_in_self],	
+            "b ... -> (b n) ...",
+            n=n_times_crossframe_attn_in_self,
+        )
+        v = repeat(
+            v[::n_times_crossframe_attn_in_self],
+            "b ... -> (b n) ...",
+            n=n_times_crossframe_attn_in_self,
+        )
+            
     h = self.heads
 
     q = self.to_q(x)
@@ -119,6 +162,9 @@ def xattn_forward_log(self, x, context=None, mask=None):
     out = einsum('b i j, b j d -> b i d', sim, v)
     out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
     out = self.to_out(out)
+
+    if additional_tokens is not None:
+        out = out[:, n_tokens_to_mask:]
     global current_outsize
     current_outsize = out.shape[-2:]
     return out
@@ -128,6 +174,7 @@ current_selfattn_map = None
 current_sag_guidance_scale = 1.0
 sag_enabled = False
 sag_mask_threshold = 1.0
+sag_blur_sigma = 1.0
 
 current_xin = None
 current_outsize = (64,64)
@@ -188,8 +235,6 @@ class Script(scripts.Script):
             "text_uncond": current_uncond_emb,
         }
 
-
-
     def denoised_callback(self, params: CFGDenoisedParams):
         if not sag_enabled:
             return
@@ -205,8 +250,12 @@ class Script(scripts.Script):
         bh, hw1, hw2 = attn_map.shape
         b, latent_channel, latent_h, latent_w = original_latents.shape
         h=8
-
+        sdxl=False
+        
         middle_layer_latent_size = [math.ceil(latent_h/8), math.ceil(latent_w/8)]
+        if (middle_layer_latent_size[0] * middle_layer_latent_size[1] < hw1):
+            middle_layer_latent_size = [math.ceil(latent_h/4), math.ceil(latent_w/4)]
+            sdxl=True
 
         attn_map = attn_map.reshape(b, h, hw1, hw2)
         attn_mask = attn_map.mean(1, keepdim=False).sum(1, keepdim=False) > sag_mask_threshold
@@ -219,19 +268,31 @@ class Script(scripts.Script):
         attn_mask = F.interpolate(attn_mask, (latent_h, latent_w))
 
         # Blur according to the self-attention mask
-        degraded_latents = gaussian_blur_2d(original_latents, kernel_size=9, sigma=1.0)
+        if not sdxl:
+            degraded_latents = gaussian_blur_2d(original_latents, kernel_size=25, sigma=sag_blur_sigma)
+        else:
+            degraded_latents = gaussian_blur_2d(original_latents, kernel_size=49, sigma=sag_blur_sigma)
         degraded_latents = degraded_latents * attn_mask + original_latents * (1 - attn_mask)
 
         renoised_degraded_latent = degraded_latents - (uncond_output - current_xin)
+
+        if shared.sd_model.model.conditioning_key == "crossattn-adm":
+            make_condition_dict = lambda c_crossattn, c_adm: {"c_crossattn": c_crossattn, "c_adm": c_adm}
+        elif sdxl:
+            make_condition_dict = lambda c_crossattn, c_concat: {**c_crossattn, "c_concat": [c_concat]}
+        else:
+            make_condition_dict = lambda c_crossattn, c_concat: {"c_crossattn": c_crossattn, "c_concat": [c_concat]}
+
+        if sdxl:
+            degraded_pred = params.inner_model(renoised_degraded_latent, current_unet_kwargs['sigma'], cond=make_condition_dict(current_unet_kwargs['text_uncond'], [current_unet_kwargs['image_cond']]))
+        else:
+            degraded_pred = params.inner_model(renoised_degraded_latent, current_unet_kwargs['sigma'], cond=make_condition_dict([current_unet_kwargs['text_uncond']], [current_unet_kwargs['image_cond']]))
+
         # renoised_degraded_latent = degraded_latents
         # get predicted x0 in degraded direction
         global current_degraded_pred_compensation
         current_degraded_pred_compensation = uncond_output - degraded_latents
-        if shared.sd_model.model.conditioning_key == "crossattn-adm":
-            make_condition_dict = lambda c_crossattn, c_adm: {"c_crossattn": c_crossattn, "c_adm": c_adm}
-        else:
-            make_condition_dict = lambda c_crossattn, c_concat: {"c_crossattn": c_crossattn, "c_concat": [c_concat]}
-        degraded_pred = params.inner_model(renoised_degraded_latent, current_unet_kwargs['sigma'], cond=make_condition_dict([current_unet_kwargs['text_uncond']], [current_unet_kwargs['image_cond']]))
+        
         global current_degraded_pred
         current_degraded_pred = degraded_pred
 
@@ -242,25 +303,33 @@ class Script(scripts.Script):
         params.x = params.x + (current_uncond_pred - (current_degraded_pred + current_degraded_pred_compensation)) * float(current_sag_guidance_scale)
         params.output_altered = True
 
-
-
     def ui(self, is_img2img):
         with gr.Accordion('Self Attention Guidance', open=False):
-            enabled = gr.Checkbox(label="Enabled", default=False)
-            scale = gr.Slider(label='Scale', minimum=-2.0, maximum=10.0, step=0.01, value=0.75)
-            mask_threshold = gr.Slider(label='SAG Mask Threshold', minimum=0.0, maximum=2.0, step=0.01, value=1.0)
-
-        return [enabled, scale, mask_threshold]
-
-
+            with gr.Row():
+                enabled = gr.Checkbox(value=False, label="Enable Self Attention Guidance")
+            with gr.Group() as accordion:
+                scale = gr.Slider(label='Guidance Scale', minimum=-2.0, maximum=10.0, step=0.01, value=0.75)
+                mask_threshold = gr.Slider(label='Mask Threshold', minimum=0.0, maximum=2.0, step=0.01, value=1.0)
+                blur_sigma = gr.Slider(label='Gaussian Blur Sigma', minimum=0.0, maximum=10.0, step=0.01, value=1.0)
+                enabled.change(
+                    fn=lambda x: {"visible": x, "__type__": "update"},
+                    inputs=[enabled],
+                    outputs=[accordion],
+                    show_progress = False)
+        self.infotext_fields = (
+            (enabled, lambda d: gr.Checkbox.update(value="SAG Guidance Enabled" in d)),
+            (scale, "SAG Guidance Scale"),
+            (mask_threshold, "SAG Mask Threshold"),
+            (blur_sigma, "SAG Blur Sigma"))
+        return [enabled, scale, mask_threshold, blur_sigma]
 
     def process(self, p: StableDiffusionProcessing, *args, **kwargs):
-        enabled, scale, mask_threshold = args
+        enabled, scale, mask_threshold, blur_sigma = args
         global sag_enabled, sag_mask_threshold
         if enabled:
-
             sag_enabled = True
             sag_mask_threshold = mask_threshold
+            sag_blur_sigma = blur_sigma
             global current_sag_guidance_scale
             current_sag_guidance_scale = scale
             global saved_original_selfattn_forward
@@ -270,31 +339,25 @@ class Script(scripts.Script):
             saved_original_selfattn_forward = org_attn_module.forward
             org_attn_module.forward = xattn_forward_log.__get__(org_attn_module,org_attn_module.__class__)
 
+            p.extra_generation_params["SAG Guidance Enabled"] = enabled
             p.extra_generation_params["SAG Guidance Scale"] = scale
             p.extra_generation_params["SAG Mask Threshold"] = mask_threshold
-
+            p.extra_generation_params["SAG Blur Sigma"] = blur_sigma
         else:
             sag_enabled = False
-
 
         if not hasattr(self, 'callbacks_added'):
             on_cfg_denoiser(self.denoiser_callback)
             on_cfg_denoised(self.denoised_callback)
             on_cfg_after_cfg(self.cfg_after_cfg_callback)
             self.callbacks_added = True
-
-
-
-
-
         return
 
     def postprocess(self, p, processed, *args):
-        enabled, scale, sag_mask_threshold = args
+        enabled, scale, sag_mask_threshold, blur_sigma = args
         if enabled:
             # restore original self attention module forward function
-            attn_module = shared.sd_model.model.diffusion_model.middle_block._modules['1'].transformer_blocks._modules[
-                '0'].attn1
+            attn_module = shared.sd_model.model.diffusion_model.middle_block._modules['1'].transformer_blocks._modules['0'].attn1
             attn_module.forward = saved_original_selfattn_forward
         return
 
